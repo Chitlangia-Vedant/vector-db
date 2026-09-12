@@ -1,0 +1,7 @@
+-r requirements.txt
+
+pytest>=8.0
+sentence-transformers>=3.0
+
+# Optional external comparison
+# faiss-cpu>=1.7

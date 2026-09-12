@@ -1,0 +1,8 @@
+# Core engine + HTTP server
+numpy>=1.26,<3
+
+# Optional benchmark comparison
+# faiss-cpu>=1.7
+
+# Development
+pytest>=8.0

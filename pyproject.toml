@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vectordb"
+version = "0.1.0"
+description = "A vector database engine with an HNSW index implemented from scratch"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Salman Adnan" }]
+dependencies = [
+    "numpy>=1.26",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+# Only needed to run the benchmark comparison against the C library.
+bench = ["faiss-cpu>=1.7"]
+# Only needed to regenerate embeddings from text via Vertex AI.
+embed = ["google-auth>=2.0", "requests>=2.31"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+packages = ["vectordb", "server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
