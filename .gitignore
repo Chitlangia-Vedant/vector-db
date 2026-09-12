@@ -13,4 +13,3 @@ htmlcov/
 .DS_Store
 *.log
 .env
-benchmarks/data/embeddings.npz
