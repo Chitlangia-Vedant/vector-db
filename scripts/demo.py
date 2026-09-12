@@ -1,64 +1,84 @@
-"""End-to-end demo: build a collection, query it, filter, delete, persist.
-
-Run: python scripts/demo.py
-"""
-
-import tempfile
-
-import numpy as np
+from sentence_transformers import SentenceTransformer
 
 from vectordb import Collection, HNSWConfig, Metric
 
 
-def main() -> None:
-    rng = np.random.default_rng(0)
-    dim = 64
-    data = rng.standard_normal((2000, dim)).astype(np.float32)
-    cats = ["news", "sports", "tech"]
+DOCUMENTS = [
+    "The government announced new economic reforms to support small businesses.",
+    "The stock market rose after investors responded positively to the latest earnings reports.",
+    "Scientists discovered a new method for improving battery storage capacity.",
+    "The football team won the championship after a dramatic final match.",
+    "Researchers developed an artificial intelligence system for detecting diseases.",
+    "Heavy rainfall caused flooding in several cities across the region.",
+    "The company released a new smartphone with improved battery life and camera quality.",
+    "The spacecraft successfully entered orbit after completing its journey.",
+    "The cricket team defeated its opponent in the final match of the tournament.",
+    "Engineers designed a faster processor for next-generation computers.",
+    "The central bank announced a change in interest rates to control inflation.",
+    "A new study found that regular exercise can improve cardiovascular health.",
+    "The software company announced a major update to its cloud computing platform.",
+    "The basketball team secured a place in the playoffs after winning its final game.",
+    "Scientists are studying climate change and its effects on global temperatures.",
+]
 
-    with tempfile.TemporaryDirectory() as d:
-        coll = Collection.open(d, HNSWConfig(dim=dim, metric=Metric.COSINE))
-        ids = [f"doc{i}" for i in range(len(data))]
-        metas = [{"cat": cats[i % 3]} for i in range(len(data))]
-        coll.insert(data, ids, metas)
 
-        assert len(coll) == 2000
-        print("inserted", len(coll), "vectors")
+def main():
+    print("Loading embedding model...")
+    model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 
-        print("stats:", coll.stats())
+    print("Creating embeddings...")
+    embeddings = model.encode(
+        DOCUMENTS,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
 
-        q = data[42]
+    config = HNSWConfig(
+        dim=embeddings.shape[1],
+        metric=Metric.COSINE,
+        M=16,
+        ef_construction=200,
+        ef_search=40,
+    )
 
-        results = coll.query(q, k=5)
-        assert results
-        print("\nnearest to doc42:")
-        for r in results:
-            print(f"  {r.id:8s} dist={r.distance:.4f} {r.metadata}")
+    coll = Collection.open("demo_collection", config)
 
-        filtered = coll.query(q, k=5, flt={"cat": "tech"})
-        assert all(r.metadata["cat"] == "tech" for r in filtered)
+    ids = [f"doc{i}" for i in range(len(DOCUMENTS))]
+    metadata = [{"text": text} for text in DOCUMENTS]
 
-        print("\nnearest to doc42 filtered to cat=tech:")
-        for r in filtered:
-            print(f"  {r.id:8s} dist={r.distance:.4f} {r.metadata}")
+    coll.insert(embeddings, ids, metadata)
 
-        coll.delete("doc42")
+    print(f"\nIndexed {len(DOCUMENTS)} statements.")
+    print("Type a statement to find the closest matches.")
+    print("Type 'exit' to quit.\n")
 
-        after_delete = coll.query(q, k=5)
-        assert all(r.id != "doc42" for r in after_delete)
+    while True:
+        text = input("Query: ").strip()
 
-        print(f"\nafter deleting doc42, nearest is now {after_delete[0].id}")
+        if text.lower() in {"exit", "quit", "q"}:
+            break
 
-        coll.save(d)
-        coll.close()
+        if not text:
+            continue
 
-        reopened = Collection.load(d)
+        query_vector = model.encode(
+            [text],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )[0]
 
-        assert len(reopened) == 1999
-        assert all(r.id != "doc42" for r in reopened.query(q, k=5))
+        results = coll.query(query_vector, k=3)
 
-        print("reloaded from disk:", len(reopened), "vectors")
-        reopened.close()
+        print("\nBest matches:")
+
+        for rank, result in enumerate(results, start=1):
+            print(f"{rank}. {result.metadata['text']}")
+            print(f"   distance: {result.distance:.4f}")
+
+        print()
+
+    coll.close()
+    print("Demo finished.")
 
 
 if __name__ == "__main__":
