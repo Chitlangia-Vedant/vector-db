@@ -1,497 +1,215 @@
-# vectordb
+# chitlangia-vedant/vector-db
 
-A vector database engine written from scratch in Python, built around an HNSW
-index implemented directly from the paper by Malkov and Yashunin rather than
-wrapping an existing vector-search library.
+A vector database written entirely in Python and NumPy. The core search
+implementation does not depend on FAISS, Chroma, or other high-level vector
+search libraries.
+## Interactive Search Demo
 
-The project implements approximate nearest-neighbor search, exact brute-force
-search for ground truth, metadata and filtered kNN, soft deletion, persistence,
-and a configurable HNSW search parameter for measuring the speed/accuracy
-tradeoff.
-
-The point of this project is understanding, not beating C. The graph
-construction, greedy search, neighbor-selection heuristic, level generation,
-and search logic are implemented from scratch. NumPy is used for vector
-arithmetic and distance calculations.
-
-FAISS is used only as an external benchmark reference. It is not used to
-implement the vector database.
-
-## Why it exists
-
-I wanted to understand how systems such as FAISS, hnswlib, Pinecone, and Qdrant
-perform nearest-neighbor search in high-dimensional space, so I built the core
-of one.
-
-HNSW is the interesting part: a layered graph that can be navigated greedily
-from sparse long-range connections toward dense local connections.
-
-Reading the paper is one thing. Implementing the graph, verifying it against
-exact search, supporting deletion and persistence, and measuring the
-speed/accuracy tradeoff makes the algorithm much easier to understand.
-
-## Features
-
-* **HNSW index from scratch** (`vectordb/hnsw.py`)
-
-  * Multi-layer graph
-  * Probabilistic level assignment
-  * Greedy search through upper layers
-  * Configurable `M`
-  * Configurable `efConstruction`
-  * Configurable `efSearch`
-  * Neighbor-selection heuristic based on Algorithm 4 from the HNSW paper
-  * Optional pruned-candidate connections
-  * L2, cosine, and inner-product distance metrics
-
-* **Exact brute-force index** (`vectordb/flat.py`)
-
-  * Scans every vector
-  * Used as the ground truth for ANN recall measurements
-
-* **Soft deletion**
-
-  * Deleted nodes are marked with tombstones
-  * Deleted nodes are excluded from search results
-  * Tombstoned nodes remain in the graph so their connections can still help
-    traversal
-
-* **Rebuilding**
-
-  * `HNSW.rebuild()` creates a fresh graph containing the live vectors
-  * Useful for removing the cost of accumulated tombstones
-
-* **Persistence** (`vectordb/storage.py`)
-
-  * Binary snapshots
-  * Write-ahead log
-  * CRC-protected WAL records
-  * Durable writes using `fsync`
-  * Recovery after process interruption
-
-* **Collection layer** (`vectordb/collection.py`)
-
-  * User-facing string IDs
-  * Metadata
-  * Filtered nearest-neighbor queries
-  * Persistence and deletion handling
-
-* **Benchmarking** (`benchmarks/`)
-
-  * Exact ground truth
-  * Recall@10
-  * p50 latency
-  * p95 latency
-  * Queries per second
-  * `efSearch` sweep
-  * FAISS comparison
-
-* **End-to-end demo** (`scripts/demo.py`)
-
-  * Insert vectors
-  * Search
-  * Metadata filtering
-  * Delete
-  * Save and reload
-
-## Architecture
+[Interactive CLI Execution GIF Placeholder]
 
 ```text
-vectordb/
-    distance.py
-    config.py
-    hnsw.py
-    flat.py
-    storage.py
-    collection.py
+$ python scripts/demo.py
+Loading embedding model...
+Creating embeddings...
 
-benchmarks/
-    generate_embeddings.py
-    run_benchmark.py
-    data/
-    results/
+Indexed 15 statements.
+Type a statement to find the closest matches.
+Type 'exit' to quit.
 
-scripts/
-    demo.py
+Query: How are scientists using AI to detect illnesses?
 
-tests/
-    conftest.py
-    test_hnsw.py
-
-docs/
-    ARCHITECTURE.md
-    BENCHMARKS.md
+Best matches:
+1. Researchers developed an artificial intelligence system for detecting diseases.
+   distance: 0.2058
+2. Scientists are studying climate change and its effects on global temperatures.
+   distance: 0.7597
+3. Engineers designed a faster processor for next-generation computers.
+   distance: 0.8473
 ```
 
-The `Collection` layer maps user-facing IDs to internal HNSW node IDs, stores
-metadata, and coordinates persistence.
+## Core Architecture
 
-The HNSW index stores vectors in a growing float32 matrix. Each node has a
-randomly assigned maximum layer and a neighbor list for every layer in which
-it exists.
+This repository implements two search indexes directly in NumPy.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the detailed
-implementation explanation.
+### Exact Search Index
+The `FlatIndex` class performs exhaustive distance calculations across the entire vector space. It guarantees exact nearest neighbor retrieval. This index provides the absolute ground truth for evaluating the accuracy of the approximate search.
 
-## Setup
+### Approximate Search Index
+The `HNSW` (Hierarchical Navigable Small World) class implements approximate nearest neighbor search using a multi-layered graph. It supports vector insertion, search, and deletion.
 
-Create a virtual environment and install the project:
+```text
+Layer 2:                  [A]
+                          |
+Layer 1:          [B] --- [A] --- [C]
+                   |       |       |
+Layer 0:    [D]---[B]---[E]---[A]---[C]---[F]
+             \     |     |     |     /
+              [G]--+-----+-----+---[H]
+```
 
+Upper layers provide long-range routing. Layer 0 contains the broader graph used to identify the final nearest neighbors.
+
+### Vector Deletion
+Deletion uses tombstones. When a node is deleted, its ID is added to the deleted-node set. Deleted nodes are excluded from search results but remain in the graph so that their existing connections can still participate in traversal. This avoids expensive graph rewiring during every deletion. The `rebuild()` operation creates a new HNSW graph containing only live nodes.
+
+### Cosine Distance Calculation
+
+For cosine search, vectors are L2-normalized before indexing and the query is
+normalized before search. Therefore cosine similarity reduces to the dot product:
+
+$d(u, v) = 1.0 - (u \cdot v)$
+
+The implementation computes cosine distance using a dot product without
+repeatedly calculating vector norms during search.
+
+### Layer Assignment
+HNSW assigns each node a random maximum level using an exponentially decreasing distribution. The distribution parameter is:
+
+$m_L = 1 / \ln(M)$
+
+M is the maximum number of graph neighbors configured for a node. For a random value U in (0, 1], the implementation samples:
+
+$\text{level} = \lfloor-\ln(U) \times m_L\rfloor$
+
+## Benchmark Results
+
+### Dataset Configuration
+
+| Parameter | Value |
+| :--- | :--- |
+| Corpus | AG News |
+| Model | `all-mpnet-base-v2` |
+| Dimensions | 768 |
+| Normalization | L2 |
+| Indexed Vectors | 50,000 |
+| Query Vectors | 500 |
+
+### Build Time and Index Size
+
+The from-scratch implementation builds the graph in Python. Its insertion process performs graph traversal and neighbor selection for every vector, which makes construction slower than FAISS's optimized native implementation. The measured index size for our HNSW includes the stored float32 vectors and graph data.
+
+| Engine | Build time | Index size |
+| :--- | :--- | :--- |
+| Ours HNSW | 3693.7 s | 160.5 MB |
+| FAISS HNSW | 29.48 s | n/a |
+
+### Exact Search Baseline
+
+The exact baseline scans every indexed vector for every query. It is used as the ground truth for recall. The exact search is guaranteed to return the true nearest neighbors, so its recall is 1.0000 by definition.
+
+| Engine | Recall@10 | p50 ms | p95 ms | QPS |
+| :--- | :--- | :--- | :--- | :--- |
+| Ours FlatIndex | 1.0000 | 118.42 | 133.37 | 8 |
+| FAISS Flat | 1.0000 | 42.707 | n/a | 23 |
+
+### HNSW Speed Versus Accuracy
+
+Approximate search requires balancing how fast a query runs against how perfectly it matches the exact ground truth. The `efSearch` parameter controls this tradeoff.
+
+Think of `efSearch` as the size of a search party exploring a city map. A small search party finishes quickly but might miss the best destination because they only checked a few paths. A large search party checks almost every path, ensuring they find the absolute best destination, but the coordination takes longer.
+
+Increasing `efSearch` expands the dynamic list of candidate nodes evaluated during graph traversal. This buys higher recall accuracy at the cost of queries per second (QPS). The benchmark demonstrates the expected HNSW tradeoff.
+
+![HNSW recall vs QPS](benchmarks/results/recall_vs_qps.png)
+
+![HNSW recall vs efSearch](benchmarks/results/recall_vs_efsearch.png)
+
+**Our HNSW**
+
+| efSearch | Recall@10 | p50 ms | p95 ms | QPS |
+| :--- | :--- | :--- | :--- | :--- |
+| 10 | 0.9576 | 2.264 | 3.639 | 419 |
+| 20 | 0.9854 | 2.378 | 3.702 | 395 |
+| 40 | 0.9942 | 3.990 | 5.918 | 239 |
+| 80 | 0.9968 | 7.518 | 22.521 | 111 |
+| 160 | 0.9984 | 12.713 | 18.502 | 76 |
+| 320 | 0.9994 | 22.959 | 37.887 | 40 |
+
+**FAISS HNSW Reference**
+
+| efSearch | Recall@10 | p50 ms | p95 ms | QPS |
+| :--- | :--- | :--- | :--- | :--- |
+| 10 | 0.9368 | 0.130 | 0.195 | 6499 |
+| 20 | 0.9770 | 0.186 | 0.270 | 5190 |
+| 40 | 0.9922 | 0.322 | 0.465 | 3008 |
+| 80 | 0.9968 | 0.550 | 0.773 | 1775 |
+| 160 | 0.9982 | 1.003 | 1.447 | 982 |
+| 320 | 0.9998 | 1.796 | 2.550 | 544 |
+
+## Transparency and Mocking Scope
+
+The core HNSW index, exact search, insertion, deletion, distance calculations,
+and persistence are implemented directly in Python and NumPy. The unit-test data is synthetic; random vectors and queries are generated with NumPy. The large-scale benchmark uses 50,500 real AG News texts embedded via `all-mpnet-base-v2`. Exact ground truth is computed by the project's brute-force `FlatIndex`. FAISS is executed solely as an external reference implementation.
+
+## Installation
+
+The project requires Python 3.8 or higher.
+
+1. Clone the repository and navigate to the project directory:
+```bash
+git clone https://github.com/Chitlangia-Vedant/vector-db.git
+cd vector-db
+```
+
+2. Create and activate a virtual environment:
 ```bash
 python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
-Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-Linux/macOS:
-
+3. Install the dependencies and the project in editable mode:
 ```bash
-source .venv/bin/activate
-```
-
-Install the core package:
-
-```bash
+pip install --upgrade pip
 pip install -e .
+pip install pytest sentence-transformers
 ```
-
-For development and tests:
-
-```bash
-pip install pytest
-```
-
-For reproducing the embedding benchmark:
-
-```bash
-pip install sentence-transformers
-```
-
-FAISS is optional and is required only for the external benchmark comparison.
 
 ## Usage
 
-### Library
-
-```python
-import numpy as np
-
-from vectordb import Collection, HNSWConfig, Metric
-
-coll = Collection.open(
-    "data/docs",
-    HNSWConfig(dim=768, metric=Metric.COSINE),
-)
-
-vectors = np.random.randn(3, 768).astype(np.float32)
-
-coll.insert(
-    vectors,
-    ids=["a", "b", "c"],
-    metadatas=[
-        {"cat": "news"},
-        {"cat": "sports"},
-        {"cat": "tech"},
-    ],
-)
-
-hits = coll.query(vectors[0], k=2)
-
-hits = coll.query(
-    vectors[0],
-    k=2,
-    flt={"cat": "news"},
-)
-
-coll.delete("a")
-
-coll.save("data/docs")
-```
-
-### Demo
-
-Run the complete insert/search/filter/delete/persistence demonstration:
-
-```bash
-python scripts/demo.py
-```
-
-The demo verifies that vectors can be inserted, queried, filtered, deleted,
-saved, and loaded again.
-
-## Benchmarks
-
-The benchmark uses **50,500 real AG News texts** embedded with
-`sentence-transformers/all-mpnet-base-v2`.
-
-The dataset is split into:
-
-* **50,000 base vectors**
-* **500 query vectors**
-* **768 dimensions**
-* **k = 10**
-
-The exact answers are calculated using the project's `FlatIndex`. These exact
-results are the ground truth used to calculate recall@10.
-
-The HNSW benchmark keeps `M = 16` and `efConstruction = 200` fixed while
-sweeping `efSearch` across:
-
-```text
-10, 20, 40, 80, 160, 320
-```
-
-For every setting the benchmark measures:
-
-* Recall@10
-* p50 query latency
-* p95 query latency
-* Queries per second
-
-### Results
-
-#### Exact baseline
-
-| Engine         | Recall@10 | p50 ms | p95 ms | QPS |
-| -------------- | --------: | -----: | -----: | --: |
-| Ours FlatIndex |    1.0000 | 118.42 | 133.37 |   8 |
-| FAISS Flat     |    1.0000 | 42.707 |    n/a |  23 |
-
-#### Our HNSW
-
-| efSearch | Recall@10 | p50 ms | p95 ms | QPS |
-| -------: | --------: | -----: | -----: | --: |
-|       10 |    0.9576 |  2.264 |  3.639 | 419 |
-|       20 |    0.9854 |  2.378 |  3.702 | 395 |
-|       40 |    0.9942 |  3.990 |  5.918 | 239 |
-|       80 |    0.9968 |  7.518 | 22.521 | 111 |
-|      160 |    0.9984 | 12.713 | 18.502 |  76 |
-|      320 |    0.9994 | 22.959 | 37.887 |  40 |
-
-#### FAISS HNSW
-
-| efSearch | Recall@10 | p50 ms | p95 ms |  QPS |
-| -------: | --------: | -----: | -----: | ---: |
-|       10 |    0.9368 |  0.130 |  0.195 | 6499 |
-|       20 |    0.9770 |  0.186 |  0.270 | 5190 |
-|       40 |    0.9922 |  0.322 |  0.465 | 3008 |
-|       80 |    0.9968 |  0.550 |  0.773 | 1775 |
-|      160 |    0.9982 |  1.003 |  1.447 |  982 |
-|      320 |    0.9998 |  1.796 |  2.550 |  544 |
-
-Our HNSW therefore provides a clear speed/accuracy curve:
-
-```text
-efSearch   recall@10   QPS
-10         0.9576      419
-20         0.9854      395
-40         0.9942      239
-80         0.9968      111
-160        0.9984       76
-320        0.9994       40
-```
-
-At `efSearch=40`, the implementation reaches 0.9942 recall@10 at 239 QPS.
-Increasing `efSearch` to 320 raises recall to 0.9994 while reducing throughput
-to 40 QPS.
-
-The exact `FlatIndex` provides 1.0000 recall and approximately 8 QPS on the
-same benchmark.
-
-FAISS is much faster because it is an optimized native implementation. At
-`efSearch=320`, FAISS reaches 0.9998 recall at 544 QPS compared with 0.9994
-recall at 40 QPS for this implementation.
-
-The purpose of the comparison is not to beat FAISS. It demonstrates that the
-from-scratch implementation produces high-recall nearest-neighbor results
-while exposing the algorithm and its tradeoffs directly in Python.
-
-Full benchmark methodology and measurements are documented in
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
-
-Raw results are stored in:
-
-```text
-benchmarks/results/results.json
-```
-
-## Reproducing the benchmark
-
-The embedding generation step downloads the AG News dataset and generates
-embeddings using `sentence-transformers/all-mpnet-base-v2`.
-
-```bash
-python benchmarks/generate_embeddings.py --limit 50500
-```
-
-This produces:
-
-```text
-benchmarks/data/embeddings.npz
-```
-
-The benchmark can then be run without regenerating the embeddings:
-
-```bash
-python benchmarks/run_benchmark.py \
-    --ef-values 10,20,40,80,160,320
-```
-
-On Windows PowerShell:
-
-```powershell
-python benchmarks/run_benchmark.py --ef-values 10,20,40,80,160,320
-```
-
-Embedding generation is intentionally not part of the benchmark timing.
-The generated embeddings are reused for subsequent benchmark runs.
-
-## Tests
-
-Run the test suite with:
-
+Run the unit test suite to verify core operations:
 ```bash
 pytest -q
 ```
 
-The current test suite focuses on the HNSW implementation and verifies:
-
-* Recall against exact brute-force search
-* L2, cosine, and inner-product metrics
-* Recall behaviour as `efSearch` increases
-* Random HNSW layer distribution
-* Empty and single-node searches
-* Sorted search results
-
-The benchmark provides the large-scale correctness and performance
-measurement, while the tests provide smaller deterministic correctness checks.
-
-## Design decisions
-
-### Exact search as ground truth
-
-The project contains its own brute-force `FlatIndex` instead of relying on
-FAISS to determine correctness.
-
-For every query, the exact index scans all 50,000 base vectors and returns the
-true top-k results. HNSW results are compared against these results to
-calculate recall.
-
-This makes the benchmark independent of the external ANN implementation.
-
-### `efSearch` as the accuracy knob
-
-`efSearch` controls how many candidates HNSW explores during a query.
-
-Higher values generally improve recall while increasing query work.
-
-This parameter can be changed after building the index, which makes it useful
-for measuring the recall/latency tradeoff.
-
-### `efConstruction` as the build-time knob
-
-`efConstruction` controls how much work is performed while constructing the
-graph.
-
-Higher values can produce a better graph, but increase build time.
-
-Unlike `efSearch`, changing `efConstruction` requires rebuilding the index.
-
-### Soft deletion
-
-Deletion uses tombstones rather than immediately modifying the graph.
-
-A deleted node remains available to graph traversal but is excluded from
-returned search results.
-
-This makes deletion cheap and preserves graph connectivity. The tradeoff is
-that deleted nodes continue to consume memory until the graph is rebuilt.
-
-### NumPy usage
-
-NumPy is used for vector storage and arithmetic, including distance
-calculations.
-
-The HNSW graph traversal, candidate management, neighbor selection, and graph
-updates are implemented directly in Python.
-
-## Challenges
-
-### Neighbor selection
-
-A simple implementation that keeps only the closest `M` candidates can create
-clusters of similar links.
-
-The HNSW neighbor-selection heuristic instead considers whether a candidate
-provides a useful direction relative to already selected neighbors.
-
-Implementing this correctly was important for producing a navigable graph and
-high recall.
-
-### Level generation
-
-Each node receives a random maximum layer using the HNSW level-generation
-formula:
-
-```text
-level = floor(-ln(u) * mL)
-mL = 1 / ln(M)
+Start the interactive semantic search prompt:
+```bash
+python scripts/demo.py
 ```
 
-Most nodes therefore exist only at layer 0, while progressively fewer nodes
-appear at higher layers.
+### Executing the Benchmark
 
-### Python insertion speed
+The repository includes pre-computed embeddings located at `benchmarks/data/embeddings.npz`. Run the benchmark across multiple `efSearch` values to evaluate the system:
 
-The main performance limitation is graph construction in Python.
+```bash
+python benchmarks/run_benchmark.py --ef-values 10,20,40,80,160,320
+```
 
-Each insertion performs graph traversal, distance calculations, candidate
-management, and neighbor updates. Although NumPy accelerates vector
-arithmetic, the graph algorithm still performs many small operations from
-Python.
+Raw metrics export to `benchmarks/results/results.json`.
 
-The benchmark makes this limitation visible rather than hiding it.
+To completely regenerate the embeddings from the raw text corpus:
 
-### Persistence and recovery
+```bash
+python benchmarks/generate_embeddings.py --limit 50500
+python benchmarks/run_benchmark.py --ef-values 10,20,40,80,160,320
+```
 
-The storage layer separates durable logging from in-memory graph state.
+To reproduce the FAISS comparison column in the benchmark, install FAISS separately (`pip install faiss-cpu`) before executing `run_benchmark.py`.
 
-The WAL uses framed records and checksums so incomplete records at the end of a
-file can be detected during recovery.
+### Dataset Configuration
 
-Snapshots provide a durable representation of the current collection while
-the WAL records subsequent operations.
+| Parameter | Value |
+| :--- | :--- |
+| Corpus | AG News |
+| Model | `all-mpnet-base-v2` |
+| Dimensions | 768 |
+| Normalization | L2 |
+| Indexed Vectors | 50,000 |
+| Query Vectors | 500 |
 
-## What I learned
+## Project Structure
 
-* HNSW uses sparse upper layers for long-range navigation and a dense bottom
-  layer for local search.
-* The neighbor-selection heuristic is important because graph connectivity is
-  not determined by distance alone.
-* `efSearch` provides a practical speed/accuracy control after the graph has
-  been built.
-* Exact brute-force search provides a simple and reliable ground truth for
-  measuring ANN recall.
-* Soft deletion preserves graph connectivity but leaves tombstones that may
-  eventually require rebuilding.
-* Persistence requires careful ordering and recovery logic, not just writing
-  data to disk.
-* Optimized native ANN libraries are much faster than a straightforward Python
-  implementation, but implementing the algorithm directly makes its behaviour
-  easier to inspect and understand.
-
-## What I would do differently
-
-* Move the graph traversal and insertion hot path into a compiled extension
-  such as Cython, Rust, or C.
-* Replace Python adjacency lists with more compact contiguous structures.
-* Make filtered search more deeply integrated with graph traversal rather than
-  relying on exact scanning for selective filters.
-* Add vector quantization to reduce memory usage.
-* Add sharding and replication for a distributed deployment.
-* Improve checkpointing so recovery requires less WAL replay.
-
+* `benchmarks/`: Data, scripts, and results for exact versus approximate evaluation.
+* `docs/ARCHITECTURE.md`: Detailed internal data structures and distance metric proofs.
+* `docs/BENCHMARKS.md`: Extended timing profiles and memory footprint calculations.
+* `scripts/`: Interactive demo files.
+* `tests/`: Synthetic unit tests.

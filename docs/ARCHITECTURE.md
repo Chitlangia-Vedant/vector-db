@@ -1,220 +1,277 @@
 # Architecture
 
-This document explains how the engine works, in enough detail that the owner
-can study it and explain HNSW from memory. It is written in my own words from
-the paper (Malkov & Yashunin, arXiv:1603.09320), not copied from a library.
+This document describes the main data structures and algorithms used by the vector database.
 
-## Layout
+## Project Layout
 
-```
+```text
 vectordb/
-  distance.py    metrics (L2, cosine, inner product) as "smaller = closer"
-  config.py      dataclass configs (HNSWConfig)
-  hnsw.py        the HNSW index: graph, insert, search, heuristic, delete
-  flat.py        brute-force exact index (ground truth for recall)
-  storage.py     binary snapshot format + write-ahead log
-  collection.py  ids + metadata + filtered search + durability, over an HNSW
-benchmarks/      embedding generation + recall/latency benchmark
+    distance.py      Distance metrics
+    config.py        HNSW configuration
+    hnsw.py          HNSW graph and search
+    flat.py          Exact brute-force index
+    storage.py       Persistence
+    collection.py    IDs, metadata, and queries
+
+benchmarks/
+    generate_embeddings.py
+    run_benchmark.py
+
 tests/
-    conftest.py      deterministic test dataset fixture
-    test_hnsw.py     HNSW correctness tests
+    conftest.py
+    test_hnsw.py
+
 scripts/
-    demo.py          end-to-end insert/search/filter/delete/persistence demo
+    demo.py
 ```
 
-## The problem
+## HNSW
 
-Exact nearest-neighbor search means scanning every stored vector for each query:
-O(n) distance computations. At a few thousand vectors that is fine (`flat.py`
-does exactly this, and it is the ground truth we measure recall against). At
-millions it is too slow. Approximate nearest neighbor (ANN) trades a little
-recall for a large speedup. HNSW is one of the strongest ANN methods on CPU.
+The approximate index is a Hierarchical Navigable Small World graph.
 
-## HNSW in one paragraph
+Layer 0 contains every node. Higher layers contain progressively fewer nodes and provide long-range routing.
 
-Build a graph where each vector is a node connected to a handful of nearby
-vectors. To search, start somewhere and repeatedly walk to whichever neighbor is
-closer to the query (greedy routing). A single flat graph gets stuck in local
-minima and needs long-range links to cross the space quickly. HNSW solves that
-with **layers**: a stack of graphs where the top layers are sparse (long hops
-across the whole space) and the bottom layer contains every node (fine-grained
-local search). You descend layer by layer, using each layer's result as the
-entry point for the next, so the search zooms in like a skip list for geometry.
-
-## The layered graph
-
-```
- layer 2        (A)                      few nodes, long-range links
-                 |  \
- layer 1     (A)-(D)---(G)               more nodes
-              |    |     |
- layer 0  (A)(B)(C)(D)(E)(F)(G)(H)...     every node, dense local links
+```text
+Layer 2:                  [A]
+                          |
+Layer 1:          [B] --- [A] --- [C]
+                   |       |       |
+Layer 0:    [D]---[B]---[E]---[A]---[C]---[F]
+             \     |     |     |     /
+              [G]--+-----+-----+---[H]
 ```
 
-A node assigned top level `L` exists on layers `0..L`. Most nodes only live on
-layer 0. The number of layers a node gets is random:
+A node with maximum level `L` exists on every layer from `0` through `L`.
 
-```
-level = floor( -ln(uniform(0,1)) * mL )     with mL = 1 / ln(M)
-```
+### Level Assignment
 
-This is sampling from a geometric distribution: the probability of reaching
-level `l` decays by a factor of `M` per level, so if `M = 16` roughly 1 node in
-16 reaches level 1, 1 in 256 reaches level 2, and so on. That decay is what
-gives the expected O(log n) number of layers and O(log n) search. `test_hnsw.py`
-checks that the empirical fraction of nodes above layer 0 is close to `1/M`.
+Levels follow an exponentially decreasing distribution:
 
-Storage: all vectors live in one growing float32 matrix; a node's id is its row
-index. `self._levels[node]` is its top layer. `self._links[node][layer]` is the
-list of neighbor ids at that layer.
+$$
+level = \lfloor-\ln(U) \times m_L\rfloor
+$$
 
-## Distance
+where:
 
-The index only ever compares distances, so every metric is expressed as
-"smaller means closer":
+$$
+m_L = \frac{1}{\ln(M)}
+$$
 
-- **L2**: squared Euclidean distance (we skip the square root, it is monotonic).
-- **cosine**: vectors are L2-normalized on insert, then cosine distance is
-  `1 - dot`. After normalization it is the same code path as inner product.
-- **inner product**: `-dot`, negated so larger similarity sorts first.
+`M` is the maximum number of connections on upper layers.
 
-Distances are computed in batches with numpy: for a query and a set of neighbor
-rows we do one vectorized operation instead of a Python loop. numpy is used only
-for this arithmetic; the graph logic is pure Python.
+For `M = 16`, approximately 1 in 16 nodes reaches level 1 and 1 in 256 reaches level 2.
 
-## Search (Algorithm 2 and 5)
+## Data Structures
 
-Two pieces.
+The HNSW index maintains:
 
-**Greedy descent (ef = 1).** From the entry point on a layer, look at the
-current node's neighbors, jump to the closest one to the query, repeat until no
-neighbor is closer. This finds a local minimum on that layer fast. Used on every
-layer above 0 during a query (`_greedy_descend`).
-
-**Search-layer (ef > 1).** On layer 0 (and during construction) we need more
-than one candidate, so we keep a dynamic list of the `ef` best nodes found so
-far. Two heaps drive it:
-
-- a min-heap of *candidates to explore* (nearest first),
-- a max-heap of *results kept* (farthest first), capped at `ef`.
-
-Pop the nearest candidate; if it is farther than the worst kept result and we
-already have `ef` results, stop (nothing closer can be reached). Otherwise expand
-its unvisited neighbors, and for each one that is closer than the current worst
-(or while we still have room), push it into both heaps and evict the worst if we
-exceed `ef`. Larger `ef` explores more of the graph: higher recall, more work.
-That is the recall/latency knob the benchmark sweeps.
-
-**Full query.** Greedy-descend from the top layer down to layer 1 to get a good
-entry point, then run search-layer with `ef = max(efSearch, k)` on layer 0, sort,
-and return the top `k` live results.
-
-## Insert (Algorithm 1)
-
-1. Draw a random top level `L` for the new node (formula above).
-2. Greedy-descend from the current entry point through the layers above `L`,
-   using `ef = 1`, to arrive near the new node's neighborhood cheaply.
-3. From `min(topLevel, L)` down to 0, on each layer:
-   - run search-layer with `efConstruction` to gather candidate neighbors,
-   - pick up to `M` of them with the selection heuristic (below),
-   - add links both ways (new node <-> chosen neighbors),
-   - if a neighbor now exceeds its max degree (`M` above layer 0, `M0 = 2M` on
-     layer 0), re-run the heuristic on its link list to prune it back. Keeping
-     layer 0 twice as dense is the paper's recommendation and matters for recall.
-4. If `L` is above the current top, the new node becomes the entry point.
-
-`efConstruction` controls graph quality: a larger candidate list during build
-produces a better-connected graph and higher query recall, at the cost of slower
-inserts.
-
-## The neighbor-selection heuristic (Algorithm 4)
-
-The naive choice is "keep the M nearest candidates". That clusters all of a
-node's links in one direction and leaves whole regions unreachable, so greedy
-search gets stuck. The heuristic instead keeps a candidate **only if it is closer
-to the base node than to any already-selected neighbor**:
-
-```
-for each candidate e, nearest first:
-    if dist(e, base) < min over selected r of dist(e, r):
-        select e
-    else:
-        set e aside (pruned)
+```text
+_matrix        float32 vector matrix
+_levels        maximum level for each node
+_links         neighbor lists per node and layer
+_deleted       tombstoned node IDs
+_entry_point   starting node for search
+_max_level     highest graph layer
 ```
 
-Intuitively: if `e` is closer to something we already picked than to the base,
-that region is already covered, so `e` is redundant. This spreads links across
-directions and is what makes the small world navigable.
+Node IDs correspond to rows in `_matrix`.
 
-Two options from the paper are implemented:
+NumPy handles vector storage and numerical operations. Graph traversal and heap management use Python data structures.
 
-- **keep_pruned_connections** (on by default): if the diversity filter selects
-  fewer than `M`, backfill from the set-aside candidates so nodes stay
-  well-connected.
-- **extend_candidates** (off by default): also consider the neighbors of the
-  candidates. Rarely needed; matches common implementations leaving it off.
+## Distance Metrics
+
+All metrics are represented as distances where smaller values are better.
+
+**Squared L2**
+
+$$
+d(u,v)=\|u-v\|^2
+$$
+
+The square root is omitted because it does not change distance ordering.
+
+**Cosine**
+
+For L2-normalized vectors:
+
+$$
+d(u,v)=1-(u\cdot v)
+$$
+
+The query is normalized before cosine search.
+
+**Inner Product**
+
+$$
+d(u,v)=-(u\cdot v)
+$$
+
+This converts similarity maximization into distance minimization.
+
+## Search
+
+Search begins at `_entry_point` on the highest layer.
+
+Upper layers use greedy routing:
+
+1. Examine the current node's neighbors.
+2. Move to a closer neighbor when one exists.
+3. Stop at the local minimum.
+4. Continue from that node on the next layer.
+
+Layer 0 performs exploratory search using:
+
+* a min-heap of candidates,
+* a bounded max-heap of results,
+* a visited-node set.
+
+The search depth is:
+
+$$
+ef=\max(efSearch,k)
+$$
+
+Higher `efSearch` values examine more candidates and generally improve recall while reducing query throughput.
+
+Deleted nodes are excluded from returned results but can still participate in graph traversal.
+
+## Insertion
+
+Insertion:
+
+1. Samples the node's maximum level.
+2. Adds its vector to `_matrix`.
+3. Descends from the current entry point to the node's target level.
+4. Searches each relevant layer using `efConstruction`.
+5. Selects neighboring nodes.
+6. Creates bidirectional links.
+7. Prunes connections exceeding the layer limit.
+8. Updates the entry point if the new node reaches a higher level.
+
+The layer 0 connection limit is larger than the upper-layer limit.
+
+## Neighbor Selection
+
+Candidates are selected using a diversity-aware heuristic rather than simply taking the closest nodes.
+
+The heuristic prefers connections that provide useful graph coverage relative to already selected neighbors. This helps prevent connections from concentrating in one local direction.
+
+The implementation is contained in `vectordb/hnsw.py`.
 
 ## Deletion
 
-Deletes are soft. `mark_deleted()` adds the internal node id to a tombstone
-set. Deleted nodes remain in the graph so their links can still provide
-connectivity during traversal, but `search()` excludes tombstoned nodes from
-the returned results.
+Deletion uses tombstones.
 
-This makes deletion cheap and avoids immediately modifying the graph structure.
-The tradeoff is that deleted nodes continue to consume memory and may still be
-visited during search.
+```text
+mark_deleted(node)
+        |
+        v
+add node ID to _deleted
+        |
+        v
+node remains in graph
+        |
+        v
+excluded from final search results
+```
 
-`HNSW.rebuild()` creates a fresh graph containing only live vectors while
-preserving the existing internal node ids of surviving vectors. This is useful
-for removing tombstones after a deletion-heavy workload.
+Deleted nodes remain connected so their existing edges can still assist graph traversal.
 
-The public `Collection.delete()` operation uses this deletion mechanism and
-updates the collection's id mapping and persistence state accordingly.
+This avoids expensive graph rewiring during every deletion, but deleted nodes continue to consume memory and may add traversal overhead.
 
-Soft deletion is therefore the normal fast path, while rebuilding is the
-compaction mechanism when tombstones become costly.
+### Rebuild
 
-## Persistence and durability
+`HNSW.rebuild()` removes tombstones by creating a new graph and reinserting only live nodes.
 
-Two mechanisms in `storage.py`, described honestly.
+Surviving node IDs are preserved.
 
-**Snapshot** (`save_hnsw` / `load_hnsw`): a compact little-endian binary file
-holding the header (dim, metric, M, M0, efConstruction, size, entry point, max
-level), then per node its level and neighbor lists per layer, then the tombstone
-set, then the raw float32 vector matrix. The exact byte layout is documented at
-the top of `storage.py`. It is written to a temp file and `os.replace`d into
-place, so a snapshot is atomic: you never see a half-written graph.
+## Persistence
 
-**Write-ahead log** (`WriteAheadLog`): an append-only log. Every insert and
-delete is framed (`magic | length | payload | crc32`), written, and **fsync'd
-before** the operation is applied to the in-memory index. So an operation is
-durable the moment it is acknowledged. On load we read the snapshot, then replay
-whatever remains in the WAL (everything since the last snapshot). A crash
-mid-write leaves a torn tail whose length or crc will not check out; replay stops
-at that record and discards it, which is exactly the right recovery boundary.
-`save()` folds the WAL into a fresh snapshot and truncates it.
+`vectordb/storage.py` stores the state required to reload an index, including:
 
-What this guarantees, stated plainly: any insert/delete that returned to the
-caller survives a process kill, because it was fsync'd to the WAL first. What it
-does **not** do: it is not a distributed log, there is no group commit or
-batched fsync (so per-record fsync makes inserts slower but simpler to reason
-about), and recovery replay re-inserts WAL records into a fresh graph rather than
-restoring the exact original graph. The recovered index is correct and
-searchable; it is not bit-identical to the pre-crash graph, which is fine for an
-ANN index.
+* vectors
+* node levels
+* graph links
+* entry point
+* maximum level
+* deleted nodes
+* index configuration
 
-## Collection layer
+Snapshots are written to a temporary file and atomically replaced with `os.replace()`.
 
-`Collection` maps user string ids to internal node ids, stores per-vector
-metadata dicts, and owns the WAL. Filtered kNN has two implementations:
+## Collection Layer
 
-- **prefilter**: gather node ids whose metadata matches, then brute-force scan
-  just those vectors. Exact by construction; cost is O(matches). Best when the
-  filter is selective.
-- **postfilter**: run the ANN search with an enlarged candidate list, then drop
-  non-matching hits. Cheap when the filter passes most vectors, but it can return
-  fewer than `k` when the filter is very selective, because the graph traversal
-  is filter-blind.
+`Collection` provides the application-level interface around the index.
 
-Both are shipped so the tradeoff is a per-query choice, not a baked-in decision.
+It handles:
+
+* string document IDs
+* vector insertion
+* metadata
+* nearest-neighbor queries
+* deletion
+* saving and loading
+
+External IDs are mapped to internal integer node IDs:
+
+```text
+"doc_001" -> 0
+"doc_002" -> 1
+"doc_003" -> 2
+```
+
+Metadata filtering is handled by the collection layer rather than the HNSW graph.
+
+## Exact Search
+
+`FlatIndex` performs exhaustive search over every stored vector.
+
+It provides exact nearest-neighbor results and is therefore used as the ground truth for evaluating HNSW recall.
+
+## Benchmark Architecture
+
+The benchmark uses:
+
+```text
+Dataset:          AG News
+Embedding model:  all-mpnet-base-v2
+Dimensions:       768
+Base vectors:     50,000
+Query vectors:    500
+k:                10
+M:                16
+efConstruction:   200
+```
+
+The benchmark evaluates:
+
+```text
+efSearch = 10, 20, 40, 80, 160, 320
+```
+
+For each setting it records:
+
+* Recall@10
+* p50 latency
+* p95 latency
+* Queries per second
+
+`FlatIndex` provides the exact ground truth. FAISS is used only as an external comparison and is not part of the custom search implementation.
+
+## Design Tradeoffs
+
+**FlatIndex vs HNSW**
+
+Flat search guarantees exact results but scans every vector. HNSW reduces the search space and trades some recall for higher throughput.
+
+**Tombstones vs graph rewiring**
+
+Tombstones make deletion cheap. The cost is additional memory and traversal work until `rebuild()` is performed.
+
+**Python and NumPy**
+
+The HNSW graph logic is implemented in Python, while NumPy handles vector storage and numerical calculations. This keeps the implementation transparent while avoiding high-level vector-search libraries.
+
+**efSearch**
+
+Lower values favor speed. Higher values favor recall. The benchmark measures this tradeoff across multiple settings rather than using a single accuracy value.
