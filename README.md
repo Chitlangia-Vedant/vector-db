@@ -1,4 +1,4 @@
-# chitlangia-vedant/vector-db
+# vector-db
 
 A vector database written entirely in Python and NumPy. The core search
 implementation does not depend on FAISS, Chroma, or other high-level vector
